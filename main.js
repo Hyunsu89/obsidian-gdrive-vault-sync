@@ -53,6 +53,8 @@ class GDriveVaultSync extends Plugin {
 		cmd("scan-drive", "Drive 전체 스캔 (읽기만)", () => this.scanDrive());
 		cmd("download-preview", "Drive 다운로드 — 미리보기", () => this.download(true));
 		cmd("download-run", "Drive 다운로드 — 실행", () => this.download(false));
+		cmd("upload-preview", "Drive 업로드 — 미리보기", () => this.upload(true));
+		cmd("upload-run", "Drive 업로드 — 실행", () => this.upload(false));
 
 		this.addRibbonIcon("cloud-download", "Drive 다운로드 미리보기", () =>
 			this.run(() => this.download(true)),
@@ -160,11 +162,12 @@ class GDriveVaultSync extends Plugin {
 
 	/**
 	 * Drive 전체를 훑어 경로 -> 파일 정보 로 만든다.
-	 * 폴더는 결과에 넣지 않는다. 내려받을 때 필요한 만큼 만들면 된다.
+	 * 폴더는 따로 모은다. 업로드할 때 부모 ID 를 찾는 데 쓴다.
 	 */
 	async buildTree(token, onProgress) {
 		const excludes = this.excludeList();
 		const files = new Map();
+		const folders = new Map(); // 경로 -> 폴더 ID
 		let calls = 0;
 
 		const walk = async (folderId, relPath) => {
@@ -175,6 +178,7 @@ class GDriveVaultSync extends Plugin {
 				if (!relPath && excludes.includes(c.name)) continue;
 				const path = relPath ? relPath + "/" + c.name : c.name;
 				if (c.mimeType === FOLDER_MIME) {
+					folders.set(path, c.id);
 					await walk(c.id, path);
 				} else {
 					files.set(path, c);
@@ -183,7 +187,7 @@ class GDriveVaultSync extends Plugin {
 		};
 
 		await walk(this.settings.rootFolderId.trim(), "");
-		return { files, calls };
+		return { files, folders, calls };
 	}
 
 	// ---------------------------------------------------------------- 0단계
@@ -343,6 +347,146 @@ class GDriveVaultSync extends Plugin {
 			[
 				failed ? "⚠️ 다운로드 완료 (일부 실패)" : "✅ 다운로드 완료",
 				`받음 ${done}개 · 실패 ${failed}개 · 건드리지 않음 ${keepLocal.length}개`,
+				errors.length ? "\n" + errors.join("\n") : "",
+			].join("\n"),
+			20000,
+		);
+	}
+
+	// ---------------------------------------------------------------- 2단계
+
+	/** vault 의 로컬 파일. `.obsidian` 은 getFiles 가 애초에 주지 않는다. */
+	localTextFiles() {
+		const excludes = this.excludeList();
+		const TEXT = ["md", "txt", "canvas", "csv", "json"];
+		const out = [];
+		const skippedBinary = [];
+		for (const f of this.app.vault.getFiles()) {
+			const top = f.path.includes("/") ? f.path.split("/")[0] : "";
+			if (top && excludes.includes(top)) continue;
+			if (TEXT.includes((f.extension || "").toLowerCase())) out.push(f);
+			else skippedBinary.push(f.path);
+		}
+		return { files: out, skippedBinary };
+	}
+
+	/** Drive 에 폴더가 없으면 만든다. 경로를 위에서부터 훑으며 ID 를 돌려준다. */
+	async ensureDriveFolder(token, folders, dirPath) {
+		if (!dirPath) return this.settings.rootFolderId.trim();
+		if (folders.has(dirPath)) return folders.get(dirPath);
+
+		const parts = dirPath.split("/");
+		let cur = "";
+		let parentId = this.settings.rootFolderId.trim();
+		for (const p of parts) {
+			cur = cur ? cur + "/" + p : p;
+			if (folders.has(cur)) {
+				parentId = folders.get(cur);
+				continue;
+			}
+			const res = await requestUrl({
+				url: API + "?supportsAllDrives=true",
+				method: "POST",
+				headers: { Authorization: "Bearer " + token },
+				contentType: "application/json",
+				body: JSON.stringify({ name: p, mimeType: FOLDER_MIME, parents: [parentId] }),
+				throw: false,
+			});
+			if (res.status !== 200 && res.status !== 201) {
+				throw new Error(`폴더 생성 실패 ${cur}: ${res.status} ${(res.text || "").slice(0, 120)}`);
+			}
+			parentId = res.json.id;
+			folders.set(cur, parentId);
+		}
+		return parentId;
+	}
+
+	/** 새 파일을 Drive 에 만든다. **기존 파일은 절대 건드리지 않는다.** */
+	async createOnDrive(token, parentId, name, content) {
+		const b = "----gdvs" + Date.now();
+		const meta = JSON.stringify({ name, parents: [parentId] });
+		const body =
+			`--${b}\r\nContent-Type: application/json; charset=UTF-8\r\n\r\n${meta}\r\n` +
+			`--${b}\r\nContent-Type: text/markdown; charset=UTF-8\r\n\r\n${content}\r\n` +
+			`--${b}--\r\n`;
+
+		const res = await requestUrl({
+			url: "https://www.googleapis.com/upload/drive/v3/files?uploadType=multipart&supportsAllDrives=true",
+			method: "POST",
+			headers: { Authorization: "Bearer " + token },
+			contentType: `multipart/related; boundary=${b}`,
+			body,
+			throw: false,
+		});
+		if (res.status !== 200 && res.status !== 201) {
+			throw new Error(`${res.status} ${(res.text || "").slice(0, 160)}`);
+		}
+		return res.json.id;
+	}
+
+	/**
+	 * 로컬 -> Drive. **Drive 에 없는 파일만 올린다.**
+	 * 기존 파일 수정도, 삭제도 하지 않는다. drive.file 권한이라 애초에 불가능하다.
+	 */
+	async upload(preview) {
+		const notice = new Notice(preview ? "미리보기 계산 중…" : "업로드 준비 중…", 0);
+		const token = await this.getAccessToken();
+		const { files: driveFiles, folders } = await this.buildTree(token, (n, c) =>
+			notice.setMessage(`Drive 목록 수집 중… ${n}개`),
+		);
+		const { files: locals, skippedBinary } = this.localTextFiles();
+
+		const isNew = locals.filter((f) => !driveFiles.has(f.path));
+		const exists = locals.length - isNew.length;
+
+		if (preview) {
+			notice.hide();
+			const sample = isNew.slice(0, 8).map((f) => "   " + f.path).join("\n");
+			new Notice(
+				[
+					"📋 업로드 미리보기 (아무것도 올리지 않았다)",
+					"",
+					`새로 올릴 파일   ${isNew.length}개`,
+					isNew.length ? sample : "   (없음)",
+					isNew.length > 8 ? `   … 외 ${isNew.length - 8}개` : "",
+					"",
+					`이미 Drive 에 있음 ${exists}개 — 건드리지 않는다`,
+					skippedBinary.length ? `텍스트 아님 ${skippedBinary.length}개 — 올리지 않는다` : "",
+					"",
+					"실행하려면 «Drive 업로드 — 실행»",
+				].filter(Boolean).join("\n"),
+				30000,
+			);
+			return;
+		}
+
+		if (!isNew.length) {
+			notice.hide();
+			new Notice("올릴 새 파일이 없다.");
+			return;
+		}
+
+		let done = 0, failed = 0;
+		const errors = [];
+		for (const f of isNew) {
+			try {
+				const dir = f.path.includes("/") ? f.path.slice(0, f.path.lastIndexOf("/")) : "";
+				const parentId = await this.ensureDriveFolder(token, folders, dir);
+				const content = await this.app.vault.read(f);
+				await this.createOnDrive(token, parentId, f.name, content);
+				done++;
+			} catch (e) {
+				failed++;
+				if (errors.length < 3) errors.push(`${f.path}: ${e.message}`);
+			}
+			notice.setMessage(`업로드 ${done + failed}/${isNew.length}…`);
+		}
+
+		notice.hide();
+		new Notice(
+			[
+				failed ? "⚠️ 업로드 완료 (일부 실패)" : "✅ 업로드 완료",
+				`올림 ${done}개 · 실패 ${failed}개`,
 				errors.length ? "\n" + errors.join("\n") : "",
 			].join("\n"),
 			20000,
