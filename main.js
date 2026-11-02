@@ -3,20 +3,25 @@
  *
  *   0단계  연결 확인 · 전체 스캔          (읽기만)
  *   1단계  다운로드 — Drive → 로컬         (로컬에만 씀. Drive 무손상)
- *   2단계  업로드 — 새 파일만              (예정)
+ *   2단계  업로드 — 새 파일만              (기존 파일 수정·삭제 불가)
+ *   3단계  자동화 — 열 때 받고, 새 노트는 잠시 뒤 올린다
  *
  * 설계 원칙 — 2026-10 중복 사태에서 얻은 교훈을 구조로 박아 둔다.
- *   1. 상태 파일을 만들지 않는다.
- *      changesToken·lastSyncedAt 같은 기기별 값을 저장하지 않고 매번 Drive 를 직접 조회한다.
- *      기기 사이에 덮어쓸 상태가 없으므로 다기기에서 어긋날 수가 없다.
+ *   1. **판단에 저장된 상태를 쓰지 않는다.**
+ *      무엇을 받고 올릴지는 매번 Drive 를 직접 조회해 정한다.
+ *      구 플러그인은 changesToken·lastSyncedAt 을 저장했고 그 값이 기기 간에
+ *      공유되면서 "이미 처리했다"고 착각해 중복을 쏟아냈다.
+ *      (자동 실행 간격을 재는 타임스탬프는 저장하지만, 그 값은 **얼마나 자주 도는지**에만
+ *       영향을 주고 **무엇을 쓰는지**에는 관여하지 않는다. 틀려도 손실이 없다.)
  *   2. `.obsidian/` 을 절대 건드리지 않는다. 설정 폴더 동기화가 그 사고의 뿌리였다.
  *   3. 삭제하지 않는다. Drive 에 없는 로컬 파일은 그대로 둔다.
  *   4. 로컬이 더 최신이면 덮어쓰지 않는다. 아직 안 올린 회의록을 지키기 위해서다.
+ *   5. 자동화해도 위 네 가지는 그대로다. 그래서 자동으로 돌아도 파괴적 동작이 없다.
  *
  * 빌드 도구를 쓰지 않는다. 이 파일이 곧 배포본이다.
  */
 
-const { Plugin, PluginSettingTab, Setting, Notice, requestUrl } = require("obsidian");
+const { Plugin, PluginSettingTab, Setting, Notice, Modal, requestUrl } = require("obsidian");
 
 const TOKEN_URL = "https://oauth2.googleapis.com/token";
 const API = "https://www.googleapis.com/drive/v3/files";
@@ -29,10 +34,95 @@ const DEFAULT_SETTINGS = {
 	rootFolderId: "",
 	// 내려받지 않을 최상위 폴더. `.obsidian` 은 설정에 없어도 항상 제외한다.
 	excludes: "_migration, _attachments, 90_Archive",
+	// --- 자동화 ---
+	autoDownloadOnOpen: true,
+	autoDownloadGapMin: 60,     // 이 시간 안에 이미 돌았으면 건너뛴다
+	autoUploadNew: true,
+	autoUploadDelaySec: 60,     // 새 노트를 만들고 이만큼 조용하면 올린다
+	lastAutoDownload: 0,        // 간격 계산용. 판단 로직에는 관여하지 않는다
 };
 
 /** 항상 제외 — 설정으로도 풀 수 없다. 2번 원칙. */
 const ALWAYS_EXCLUDE = [".obsidian", ".trash"];
+
+/**
+ * 노트 자동생성 — PC 의 QuickAdd 설정 3개를 그대로 옮겨 왔다.
+ * 설정 화면이 따로 없는 것이 장점이다. 기기를 바꿔도 다시 맞출 일이 없다.
+ */
+const NOTE_TYPES = [
+	{
+		id: "meeting",
+		name: "회의록 만들기 — 업무회의",
+		template: "90_Templates/업무회의.md",
+		folder: "10_회의록/아이웍스/{{date:YYYY}}",
+		filename: "{{date:YYMMDD}} - {{VALUE}}",
+		prompt: "회의 이름",
+	},
+	{
+		id: "weekly",
+		name: "회의록 만들기 — 주간회의",
+		template: "90_Templates/주간회의.md",
+		folder: "10_회의록/아이웍스/{{date:YYYY}}",
+		filename: "{{date:YYMMDD}} - 주간회의",
+	},
+	{
+		id: "monthly",
+		name: "업무일지 만들기 — 이번 달",
+		template: "90_Templates/월간일지.md",
+		folder: "20_업무관리/일지/{{date:YYYY}}",
+		filename: "{{date:YYYY-MM}}",
+	},
+];
+
+/**
+ * 템플릿 치환. Obsidian 코어 템플릿과 QuickAdd 양쪽 문법을 다 받는다.
+ *   {{date:FMT}} {{time:FMT}} {{DATE:FMT}}  — moment 포맷. [W]WW 처럼 대괄호 이스케이프도 그대로 통한다
+ *   {{date}} {{time}}                        — 기본 포맷
+ *   {{VALUE}} {{value}} {{title}}            — 사용자가 입력한 값
+ */
+function fillTemplate(text, value) {
+	const m = window.moment();
+	return text
+		.replace(/\{\{(?:date|time):([^}]+)\}\}/gi, (_, fmt) => m.format(fmt))
+		.replace(/\{\{date\}\}/gi, m.format("YYYY-MM-DD"))
+		.replace(/\{\{time\}\}/gi, m.format("HH:mm"))
+		.replace(/\{\{(?:value|title)\}\}/gi, value || "");
+}
+
+/** 파일명에 쓸 수 없는 문자를 걷어낸다. */
+function safeName(s) {
+	return s.replace(/[\\/:*?"<>|#^[\]]/g, " ").replace(/\s+/g, " ").trim();
+}
+
+class PromptModal extends Modal {
+	constructor(app, title, onSubmit) {
+		super(app);
+		this.title = title;
+		this.onSubmit = onSubmit;
+	}
+	onOpen() {
+		const { contentEl } = this;
+		contentEl.createEl("h3", { text: this.title });
+		const input = contentEl.createEl("input", { type: "text" });
+		input.style.width = "100%";
+		const submit = () => {
+			const v = input.value.trim();
+			if (!v) return;
+			this.close();
+			this.onSubmit(v);
+		};
+		input.addEventListener("keydown", (e) => {
+			if (e.key === "Enter") submit();
+		});
+		const btn = contentEl.createEl("button", { text: "만들기" });
+		btn.style.marginTop = "12px";
+		btn.addEventListener("click", submit);
+		window.setTimeout(() => input.focus(), 50);
+	}
+	onClose() {
+		this.contentEl.empty();
+	}
+}
 
 function formBody(obj) {
 	// URLSearchParams 대신 직접 만든다. 모바일 웹뷰 차이를 타지 않기 위해서다.
@@ -46,6 +136,9 @@ class GDriveVaultSync extends Plugin {
 		await this.loadSettings();
 		this.addSettingTab(new GDriveSettingTab(this.app, this));
 
+		this.pendingUploads = new Set();
+		this.suppressEvents = false;
+
 		const cmd = (id, name, fn) =>
 			this.addCommand({ id, name, callback: () => this.run(fn) });
 
@@ -55,10 +148,109 @@ class GDriveVaultSync extends Plugin {
 		cmd("download-run", "Drive 다운로드 — 실행", () => this.download(false));
 		cmd("upload-preview", "Drive 업로드 — 미리보기", () => this.upload(true));
 		cmd("upload-run", "Drive 업로드 — 실행", () => this.upload(false));
+		cmd("sync-now", "지금 동기화 (받기 → 올리기)", () => this.syncNow());
 
-		this.addRibbonIcon("cloud-download", "Drive 다운로드 미리보기", () =>
-			this.run(() => this.download(true)),
+		for (const t of NOTE_TYPES) {
+			this.addCommand({
+				id: "new-" + t.id,
+				name: t.name,
+				callback: () => {
+					if (t.prompt) {
+						new PromptModal(this.app, t.prompt, (v) =>
+							this.run(() => this.createNote(t, v)),
+						).open();
+					} else {
+						this.run(() => this.createNote(t, ""));
+					}
+				},
+			});
+		}
+
+		this.addRibbonIcon("refresh-cw", "지금 동기화", () => this.run(() => this.syncNow()));
+		this.addRibbonIcon("file-plus", "회의록 만들기", () =>
+			new PromptModal(this.app, "회의 이름", (v) =>
+				this.run(() => this.createNote(NOTE_TYPES[0], v)),
+			).open(),
 		);
+
+		// vault 가 다 뜬 뒤에 건다. 그 전에 걸면 기존 파일이 전부 create 로 들어온다.
+		this.app.workspace.onLayoutReady(() => {
+			this.registerEvent(
+				this.app.vault.on("create", (f) => {
+					if (this.suppressEvents) return;      // 우리가 받아 쓴 파일은 무시
+					if (!f || !f.path || f.children) return;  // 폴더 제외
+					this.pendingUploads.add(f.path);
+					this.scheduleAutoUpload();
+				}),
+			);
+			this.maybeAutoDownload();
+		});
+	}
+
+	onunload() {
+		if (this.uploadTimer) clearTimeout(this.uploadTimer);
+	}
+
+	// ---------------------------------------------------------------- 자동화
+
+	/** 열 때 한 번. 너무 자주 돌지 않게 간격을 둔다. */
+	async maybeAutoDownload() {
+		const s = this.settings;
+		if (!s.autoDownloadOnOpen) return;
+		if (!s.refreshToken || !s.rootFolderId) return;   // 설정 전이면 조용히 넘어간다
+		const gap = (s.autoDownloadGapMin || 0) * 60000;
+		if (Date.now() - (s.lastAutoDownload || 0) < gap) return;
+
+		s.lastAutoDownload = Date.now();
+		await this.saveSettings();
+		await this.run(() => this.download(false, true));
+	}
+
+	/** 새 노트가 생기면 잠잠해진 뒤에 올린다. 타이핑 중에 끼어들지 않게. */
+	scheduleAutoUpload() {
+		if (!this.settings.autoUploadNew) return;
+		if (this.uploadTimer) clearTimeout(this.uploadTimer);
+		const delay = Math.max(5, this.settings.autoUploadDelaySec || 60) * 1000;
+		this.uploadTimer = setTimeout(() => {
+			this.uploadTimer = null;
+			this.pendingUploads.clear();
+			this.run(() => this.upload(false, true));
+		}, delay);
+	}
+
+	async syncNow() {
+		await this.download(false, true);
+		await this.upload(false, true);
+		new Notice("✅ 동기화 완료");
+	}
+
+	// ---------------------------------------------------------------- 노트 생성
+
+	/**
+	 * 템플릿으로 노트를 만든다. **이미 있으면 덮어쓰지 않고 그 파일을 연다.**
+	 * 월간 일지처럼 이미 존재하는 파일을 날려먹지 않기 위해서다.
+	 */
+	async createNote(type, value) {
+		const folder = fillTemplate(type.folder, value);
+		const name = safeName(fillTemplate(type.filename, value));
+		const path = `${folder}/${name}.md`;
+
+		const existing = this.app.vault.getAbstractFileByPath(path);
+		if (existing) {
+			await this.app.workspace.getLeaf(false).openFile(existing);
+			new Notice("이미 있어서 그 파일을 열었다:\n" + path, 7000);
+			return;
+		}
+
+		const tpl = this.app.vault.getAbstractFileByPath(type.template);
+		if (!tpl) throw new Error(`템플릿이 없다: ${type.template}\n(90_Templates 를 받았는지 확인)`);
+		const body = fillTemplate(await this.app.vault.read(tpl), value);
+
+		await this.ensureFolder(path);
+		const file = await this.app.vault.create(path, body);
+		await this.app.workspace.getLeaf(false).openFile(file);
+		new Notice("✅ 만들었다: " + path, 5000);
+		// create 이벤트가 걸려 있어 잠시 뒤 자동 업로드 대상이 된다
 	}
 
 	async loadSettings() {
@@ -84,6 +276,12 @@ class GDriveVaultSync extends Plugin {
 		} finally {
 			this.busy = false;
 		}
+	}
+
+	/** 자동 실행 때는 진행 상황을 띄우지 않는다. 결과만 알린다. */
+	progress(quiet, msg) {
+		if (quiet) return { setMessage() {}, hide() {} };
+		return new Notice(msg, 0);
 	}
 
 	// ---------------------------------------------------------------- 인증
@@ -259,13 +457,14 @@ class GDriveVaultSync extends Plugin {
 
 	/**
 	 * Drive -> 로컬. **로컬에만 쓴다. Drive 는 읽기만 한다.**
-	 * preview 가 true 면 아무것도 쓰지 않고 계획만 보여준다.
+	 * preview 면 아무것도 쓰지 않고 계획만 보여준다.
+	 * quiet 면 (자동 실행) 바뀐 게 있을 때만 알린다.
 	 */
-	async download(preview) {
-		const notice = new Notice(preview ? "미리보기 계산 중…" : "다운로드 준비 중…", 0);
+	async download(preview, quiet) {
+		const notice = this.progress(quiet, preview ? "미리보기 계산 중…" : "다운로드 준비 중…");
 		const token = await this.getAccessToken();
 		const adapter = this.app.vault.adapter;
-		const { files } = await this.buildTree(token, (n, c) =>
+		const { files } = await this.buildTree(token, (n) =>
 			notice.setMessage(`목록 수집 중… ${n}개`),
 		);
 
@@ -313,33 +512,40 @@ class GDriveVaultSync extends Plugin {
 		const targets = toAdd.concat(toUpdate);
 		if (!targets.length) {
 			notice.hide();
-			new Notice("받을 파일이 없다. 이미 최신이다.");
+			if (!quiet) new Notice("받을 파일이 없다. 이미 최신이다.");
 			return;
 		}
 
 		let done = 0, failed = 0;
 		const errors = [];
-		for (const path of targets) {
-			const f = files.get(path);
-			try {
-				const res = await requestUrl({
-					url: `${API}/${f.id}?alt=media&supportsAllDrives=true`,
-					method: "GET",
-					headers: { Authorization: "Bearer " + token },
-					throw: false,
-				});
-				if (res.status !== 200) throw new Error(`HTTP ${res.status}`);
-				await this.ensureFolder(path);
-				// 바이트 그대로 쓴다. vault 가 CRLF 라 텍스트 변환을 거치지 않는 편이 안전하다.
-				await adapter.writeBinary(path, res.arrayBuffer);
-				done++;
-			} catch (e) {
-				failed++;
-				if (errors.length < 3) errors.push(`${path}: ${e.message}`);
+		// 우리가 쓰는 파일이 create 이벤트로 되돌아와 업로드 대기열에 들어가지 않게 막는다
+		this.suppressEvents = true;
+		try {
+			for (const path of targets) {
+				const f = files.get(path);
+				try {
+					const res = await requestUrl({
+						url: `${API}/${f.id}?alt=media&supportsAllDrives=true`,
+						method: "GET",
+						headers: { Authorization: "Bearer " + token },
+						throw: false,
+					});
+					if (res.status !== 200) throw new Error(`HTTP ${res.status}`);
+					await this.ensureFolder(path);
+					// 바이트 그대로 쓴다. vault 가 CRLF 라 텍스트 변환을 거치지 않는 편이 안전하다.
+					await adapter.writeBinary(path, res.arrayBuffer);
+					done++;
+				} catch (e) {
+					failed++;
+					if (errors.length < 3) errors.push(`${path}: ${e.message}`);
+				}
+				if (done % 10 === 0 || done + failed === targets.length) {
+					notice.setMessage(`다운로드 ${done + failed}/${targets.length}…`);
+				}
 			}
-			if (done % 10 === 0 || done + failed === targets.length) {
-				notice.setMessage(`다운로드 ${done + failed}/${targets.length}…`);
-			}
+		} finally {
+			// 이벤트가 늦게 도착할 수 있어 잠시 뒤에 푼다
+			setTimeout(() => { this.suppressEvents = false; }, 3000);
 		}
 
 		notice.hide();
@@ -428,10 +634,10 @@ class GDriveVaultSync extends Plugin {
 	 * 로컬 -> Drive. **Drive 에 없는 파일만 올린다.**
 	 * 기존 파일 수정도, 삭제도 하지 않는다. drive.file 권한이라 애초에 불가능하다.
 	 */
-	async upload(preview) {
-		const notice = new Notice(preview ? "미리보기 계산 중…" : "업로드 준비 중…", 0);
+	async upload(preview, quiet) {
+		const notice = this.progress(quiet, preview ? "미리보기 계산 중…" : "업로드 준비 중…");
 		const token = await this.getAccessToken();
-		const { files: driveFiles, folders } = await this.buildTree(token, (n, c) =>
+		const { files: driveFiles, folders } = await this.buildTree(token, (n) =>
 			notice.setMessage(`Drive 목록 수집 중… ${n}개`),
 		);
 		const { files: locals, skippedBinary } = this.localTextFiles();
@@ -462,7 +668,7 @@ class GDriveVaultSync extends Plugin {
 
 		if (!isNew.length) {
 			notice.hide();
-			new Notice("올릴 새 파일이 없다.");
+			if (!quiet) new Notice("올릴 새 파일이 없다.");
 			return;
 		}
 
@@ -529,6 +735,41 @@ class GDriveSettingTab extends PluginSettingTab {
 		text("Refresh token", "서버에서 발급한 값을 붙여넣는다", "refreshToken", "1//0e…");
 		text("루트 폴더 ID", "Drive 의 vault 폴더 ID", "rootFolderId", "10AlHx…");
 		text("제외할 최상위 폴더", "쉼표로 구분. .obsidian 과 .trash 는 항상 제외된다", "excludes", "_migration, _attachments");
+
+		containerEl.createEl("h3", { text: "자동화" });
+		containerEl.createEl("p", {
+			text: "자동으로 돌아도 하는 일은 수동과 같다 — 받기는 로컬에만 쓰고 로컬이 최신이면 건너뛰며, 올리기는 새 파일만 만든다. 기존 파일을 고치거나 지우는 경로가 없다.",
+		});
+
+		const toggle = (name, desc, key) =>
+			new Setting(containerEl)
+				.setName(name)
+				.setDesc(desc)
+				.addToggle((t) =>
+					t.setValue(!!this.plugin.settings[key]).onChange(async (v) => {
+						this.plugin.settings[key] = v;
+						await this.plugin.saveSettings();
+					}),
+				);
+
+		const number = (name, desc, key, min) =>
+			new Setting(containerEl)
+				.setName(name)
+				.setDesc(desc)
+				.addText((t) =>
+					t.setValue(String(this.plugin.settings[key])).onChange(async (v) => {
+						const n = parseInt(v, 10);
+						if (!isNaN(n) && n >= min) {
+							this.plugin.settings[key] = n;
+							await this.plugin.saveSettings();
+						}
+					}),
+				);
+
+		toggle("열 때 자동으로 받기", "vault 를 열면 Drive 의 새 파일을 내려받는다", "autoDownloadOnOpen");
+		number("자동 받기 최소 간격 (분)", "이 시간 안에 이미 받았으면 건너뛴다", "autoDownloadGapMin", 0);
+		toggle("새 노트 자동 올리기", "노트를 만들면 잠시 뒤 Drive 에 올린다", "autoUploadNew");
+		number("올리기 대기 시간 (초)", "새 노트를 만들고 이만큼 조용하면 올린다", "autoUploadDelaySec", 5);
 	}
 }
 
